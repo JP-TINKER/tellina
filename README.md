@@ -1,6 +1,6 @@
 # Tellina
 
-Silent Linux download guard. Tellina watches `~/Downloads`, scans finished files with ClamAV, and quarantines detected malware and suspicious files. Quiet on pass. Alerts only on fail or scanner trouble.
+Silent Linux guard. Tellina watches `~/Downloads`, scans finished files with ClamAV, and quarantines detected malware and suspicious files. Quiet on pass. Alerts only on fail or scanner trouble.
 
 This is not on-access or real-time protection. A file can be opened before the background scan finishes. See [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
 
