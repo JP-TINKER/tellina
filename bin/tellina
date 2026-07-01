@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# Tellina: watch ~/Downloads; scan completed downloads (post-download gate, not on-access).
+# Pass: file stays in Downloads; one journal line (no popup).
+# Fail: quarantine + desktop alert.
+
+set -euo pipefail
+export LC_ALL=C
+
+WATCH="${DOWNLOAD_WATCH_DIR:-$HOME/Downloads}"
+QUARANTINE="${DOWNLOAD_QUARANTINE_DIR:-$HOME/.local/share/tellina/quarantine}"
+STABLE_WAIT="${DOWNLOAD_STABLE_SEC:-2}"
+DEBOUNCE_SEC="${DOWNLOAD_DEBOUNCE_SEC:-10}"
+ERROR_NOTIFY_THRESHOLD="${DOWNLOAD_ERROR_NOTIFY_THRESHOLD:-5}"
+MAX_SCAN_BYTES="${DOWNLOAD_MAX_SCAN_BYTES:-2147483648}"
+DB_MAX_AGE_SEC="${DOWNLOAD_DB_MAX_AGE_SEC:-604800}"
+
+mkdir -p "$WATCH" "$QUARANTINE"
+chmod 700 "$QUARANTINE" 2>/dev/null || true
+WATCH_ROOT=$(realpath "$WATCH")
+
+CONSEC_ERRORS=0
+ERROR_NOTIFIED=0
+DB_STALE_NOTIFIED=0
+AV_BACKEND=clamscan
+declare -A RECENTLY_SCANNED
+
+log() {
+  echo "$(date -Is) $*"
+}
+
+clamav_db_dir() {
+  local dir
+  if command -v clamconf >/dev/null 2>&1; then
+    dir=$(clamconf -n 2>/dev/null | awk -F'= ' '/DatabaseDirectory/{print $2; exit}')
+    [[ -n "$dir" ]] && { echo "$dir"; return 0; }
+  fi
+  echo "/var/lib/clamav"
+}
+
+clamav_db_present() {
+  local d="$1"
+  [[ -f "$d/main.cvd" || -f "$d/main.cld" ]]
+}
+
+probe_clamdscan() {
+  local rc=0 testfile
+  command -v clamdscan >/dev/null || return 1
+  testfile=$(mktemp)
+  printf 'clean\n' >"$testfile"
+  clamdscan --fdpass --no-summary "$testfile" >/dev/null 2>&1 || rc=$?
+  rm -f "$testfile"
+  [[ "$rc" -eq 0 ]]
+}
+
+session_bus_address() {
+  if [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+    printf '%s' "$DBUS_SESSION_BUS_ADDRESS"
+    return 0
+  fi
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+    printf 'unix:path=%s/bus' "$XDG_RUNTIME_DIR"
+    return 0
+  fi
+  return 1
+}
+
+# Desktop toast via session D-Bus (gdbus/dbus-send). Same bubble as notify-send; no extra package.
+notify_desktop() {
+  local summary="$1" body="$2" urgency="${3:-critical}"
+  local timeout hints bus_addr
+
+  bus_addr=$(session_bus_address) || return 1
+  export DBUS_SESSION_BUS_ADDRESS="$bus_addr"
+
+  case "$urgency" in
+    critical) hints="{'urgency': <byte 2>}"; timeout=0 ;;
+    *) hints="{}"; timeout=5000 ;;
+  esac
+
+  if command -v gdbus >/dev/null 2>&1; then
+    gdbus call --session \
+      --dest org.freedesktop.Notifications \
+      --object-path /org/freedesktop/Notifications \
+      --method org.freedesktop.Notifications.Notify \
+      "Tellina" 0 "" "$summary" "$body" "[]" "$hints" "$timeout" \
+      >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v dbus-send >/dev/null 2>&1; then
+    dbus-send --session --dest=org.freedesktop.Notifications \
+      /org/freedesktop/Notifications \
+      org.freedesktop.Notifications.Notify \
+      string:Tellina uint32:0 string: string:"$summary" string:"$body" \
+      array:string: dict:string:string: int32:"$timeout" \
+      >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v notify-send >/dev/null 2>&1; then
+    local uflag=normal
+    [[ "$urgency" == critical ]] && uflag=critical
+    notify-send "$summary" "$body" -u "$uflag" 2>/dev/null && return 0
+  fi
+
+  return 1
+}
+
+notify_scan_unhealthy() {
+  notify_desktop "Tellina: scanner unhealthy" \
+    "ClamAV failed ${ERROR_NOTIFY_THRESHOLD} scans in a row. Files may not be checked." \
+    critical || true
+}
+
+notify_db_stale() {
+  notify_desktop "Tellina: virus definitions stale" \
+    "ClamAV signatures are over a week old. Run: sudo freshclam" \
+    normal || true
+}
+
+check_db_freshness() {
+  local db_dir db newest=0 age now ts
+  db_dir=$(clamav_db_dir)
+  for db in "$db_dir/main.cvd" "$db_dir/main.cld" "$db_dir/daily.cvd" "$db_dir/daily.cld"; do
+    [[ -f "$db" ]] || continue
+    ts=$(stat -c %Y "$db" 2>/dev/null || echo 0)
+    (( ts > newest )) && newest=$ts
+  done
+  (( newest == 0 )) && return 0
+  now=$(date +%s)
+  age=$(( now - newest ))
+  if (( age > DB_MAX_AGE_SEC )); then
+    log "WARN virus database age ${age}s exceeds ${DB_MAX_AGE_SEC}s; update with freshclam"
+    if (( DB_STALE_NOTIFIED == 0 )); then
+      notify_db_stale
+      DB_STALE_NOTIFIED=1
+    fi
+  fi
+}
+
+preflight() {
+  local rc=0 testfile
+
+  for cmd in inotifywait clamscan file; do
+    command -v "$cmd" >/dev/null || {
+      log "FATAL missing dependency: $cmd"
+      exit 1
+    }
+  done
+
+  if ! clamav_db_present "$(clamav_db_dir)"; then
+    log "FATAL ClamAV virus database not found (DatabaseDirectory=$(clamav_db_dir))"
+    exit 1
+  fi
+
+  check_db_freshness
+
+  clamscan --version >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    log "FATAL clamscan unusable (rc=$rc)"
+    exit 1
+  fi
+
+  if probe_clamdscan; then
+    AV_BACKEND=clamdscan
+  elif command -v clamdscan >/dev/null 2>&1; then
+    log "WARN clamdscan probe failed; using clamscan (daemon down or re-login after usermod -aG clamav)"
+  fi
+  log "START backend=$AV_BACKEND watch=$WATCH_ROOT quarantine=$QUARANTINE max_scan_bytes=$MAX_SCAN_BYTES db=$(clamav_db_dir)"
+}
+
+under_watch() {
+  local f="$1" canon
+  canon=$(realpath -e "$f" 2>/dev/null) || return 1
+  [[ "$canon" == "$WATCH_ROOT"/* ]]
+}
+
+skip_name() {
+  local base="$1"
+  [[ "$base" == .* ]] && return 0
+  case "$base" in
+    *.part|*.crdownload|*.tmp|*.partial|*.download|*.~*|*.swp) return 0 ;;
+  esac
+  return 1
+}
+
+recently_scanned() {
+  local f="$1" now last
+  now=$(date +%s)
+  last="${RECENTLY_SCANNED[$f]:-0}"
+  if (( now - last < DEBOUNCE_SEC )); then
+    return 0
+  fi
+  RECENTLY_SCANNED[$f]=$now
+  return 1
+}
+
+wait_stable() {
+  local f="$1" s1 s2
+  sleep "$STABLE_WAIT"
+  s1=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  sleep 1
+  s2=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  [[ "$s1" == "$s2" && "$s1" -gt 0 ]]
+}
+
+av_scan() {
+  local f="$1" rc=0
+  if [[ -n "${TELLINA_TEST_AV_RC:-}" ]]; then
+    printf '%s' "$TELLINA_TEST_AV_RC"
+    return 0
+  fi
+  if [[ "$AV_BACKEND" == clamdscan ]]; then
+    clamdscan --fdpass --no-summary "$f" >/dev/null 2>&1 || rc=$?
+  else
+    clamscan --infected --no-summary "$f" >/dev/null 2>&1 || rc=$?
+  fi
+  printf '%s' "$rc"
+}
+
+record_scan_error() {
+  local rc="$1" f="$2"
+  log "SKIP scan error (rc=$rc): $f"
+  CONSEC_ERRORS=$((CONSEC_ERRORS + 1))
+  if (( CONSEC_ERRORS >= ERROR_NOTIFY_THRESHOLD && ERROR_NOTIFIED == 0 )); then
+    notify_scan_unhealthy
+    ERROR_NOTIFIED=1
+  fi
+}
+
+record_scan_ok() {
+  CONSEC_ERRORS=0
+  ERROR_NOTIFIED=0
+}
+
+structure_check() {
+  local f="$1" mime="$2" info pages
+  case "$mime" in
+    *PDF*)
+      if command -v pdfinfo >/dev/null 2>&1; then
+        info=$(pdfinfo "$f" 2>&1) || true
+        if grep -qi '^Encrypted:[[:space:]]*yes' <<<"$info"; then
+          return 0
+        fi
+        pages=$(awk -F: '/^Pages:/{gsub(/ /,"",$2); print $2; exit}' <<<"$info")
+        [[ -n "$pages" && "$pages" -gt 0 ]]
+      else
+        return 0
+      fi
+      ;;
+    *EPUB*|*Zip*)
+      if [[ "${f,,}" == *.epub ]]; then
+        unzip -tqq "$f" >/dev/null 2>&1
+      else
+        return 0
+      fi
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+quarantine() {
+  local f="$1" reason="$2"
+  local base dest stamp hash
+  base=$(basename "$f")
+  stamp=$(date +%Y%m%d-%H%M%S)
+  dest="$QUARANTINE/${stamp}__${base}"
+  hash=$(sha256sum "$f" | awk '{print $1}')
+  mv -f "$f" "$dest"
+  chmod 0400 "$dest" 2>/dev/null || true
+  log "QUARANTINE $reason | sha256=$hash | $dest"
+  notify_desktop "Download blocked" "$base: $reason" critical || true
+}
+
+scan_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  skip_name "$(basename "$f")" && return 0
+  under_watch "$f" || {
+    log "SKIP path outside watch root: $f"
+    return 0
+  }
+
+  if ! wait_stable "$f"; then
+    log "SKIP unstable or empty: $f"
+    return 0
+  fi
+  [[ -f "$f" ]] || return 0
+  under_watch "$f" || {
+    log "SKIP path outside watch root: $f"
+    return 0
+  }
+  recently_scanned "$f" && return 0
+
+  local mime size rc
+  mime=$(file -b "$f" 2>/dev/null || echo unknown)
+  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+
+  if (( size > MAX_SCAN_BYTES )); then
+    log "SKIP too large (${size}B > ${MAX_SCAN_BYTES}B): $f"
+    return 0
+  fi
+
+  rc=$(av_scan "$f")
+  if [[ "$rc" -eq 1 ]]; then
+    quarantine "$f" "malware detected"
+    record_scan_ok
+    return 0
+  elif [[ "$rc" -ne 0 ]]; then
+    record_scan_error "$rc" "$f"
+    return 0
+  fi
+  record_scan_ok
+
+  if [[ "$mime" == *executable* || "$mime" == *"MS Windows"* || "$mime" == *"ELF "* ]]; then
+    if [[ "${f,,}" =~ \.(pdf|epub|mobi|azw3|docx|png|jpg|jpeg|gif|webp|txt|md|csv)$ ]]; then
+      quarantine "$f" "extension mismatch ($mime)"
+      return 0
+    fi
+  fi
+
+  if ! structure_check "$f" "$mime"; then
+    quarantine "$f" "corrupt or invalid document"
+    return 0
+  fi
+
+  log "OK ${size}B | $mime | $f"
+}
+
+if [[ "${1:-}" == "--notify" ]]; then
+  shift
+  notify_desktop "${1:?title required}" "${2:-}" critical || true
+  exit 0
+fi
+
+if [[ "${1:-}" == "--scan-once" ]]; then
+  shift
+  preflight
+  scan_file "${1:?path required for --scan-once}"
+  exit 0
+fi
+
+preflight
+
+inotifywait -r -m -e close_write -e moved_to --format '%w%f' "$WATCH_ROOT" | while read -r path; do
+  scan_file "$path" || log "ERROR processing $path"
+done

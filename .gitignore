@@ -1,0 +1,10 @@
+# Editor / OS
+*~
+.DS_Store
+*.swp
+
+# Local test artifacts (should not land in Downloads during dev)
+rt-*.txt
+rt-*.bin
+rt-*.pdf
+eicar.com

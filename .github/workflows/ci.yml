@@ -1,0 +1,25 @@
+# CI runs the --scan-once subset only. No graphical session, no user systemd service.
+# Inotify paths and session behavior are verified locally via tests/run.sh.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  scan-once:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ClamAV and tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clamav inotify-tools file unzip
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
+          sudo freshclam
+
+      - name: Run CI harness (--scan-once subset)
+        run: bash tests/run-ci.sh

@@ -1,0 +1,17 @@
+[Unit]
+Description=Tellina: scan new Downloads (ClamAV)
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+OnFailure=download-security-notify-failure.service
+
+[Service]
+ExecStart=%h/.local/bin/tellina
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

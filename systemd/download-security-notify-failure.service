@@ -1,0 +1,6 @@
+[Unit]
+Description=Tellina: notify on watcher crash
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tellina --notify "Tellina stopped" "Download scanner exited unexpectedly. Check: journalctl --user -u download-security.service"
