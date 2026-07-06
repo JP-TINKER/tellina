@@ -1,5 +1,6 @@
-# CI runs the --scan-once subset only. No graphical session, no user systemd service.
-# Inotify paths and session behavior are verified locally via tests/run.sh.
+# CI runs the --scan-once subset (tests/run-ci.sh) plus the headless inotify-loop
+# stress test (tests/stress.sh). No graphical session or user systemd service.
+# Session-only behavior is verified locally via tests/run.sh.
 name: CI
 
 on:
@@ -17,9 +18,12 @@ jobs:
       - name: Install ClamAV and tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y clamav inotify-tools file unzip
+          sudo apt-get install -y clamav inotify-tools file unzip zip
           sudo systemctl stop clamav-freshclam 2>/dev/null || true
           sudo freshclam
 
       - name: Run CI harness (--scan-once subset)
         run: bash tests/run-ci.sh
+
+      - name: Run stress harness (real inotify loop, headless)
+        run: bash tests/stress.sh

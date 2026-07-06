@@ -8,3 +8,4 @@ rt-*.txt
 rt-*.bin
 rt-*.pdf
 eicar.com
+tests/results/

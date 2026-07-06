@@ -1,26 +1,49 @@
 # Tellina
 
-Silent Linux download guard. Tellina watches `~/Downloads`, scans finished files with ClamAV, and quarantines detected malware and suspicious files. Quiet on pass. Alerts only on fail or scanner trouble.
+Tellina is a quiet virus scanner for your `~/Downloads` folder on Linux. When a
+download finishes, Tellina checks it before you'd normally get to open it. Clean
+files show up like normal. Malware gets quarantined and you get a popup. If
+nothing is wrong, you see nothing, just one line in a log.
 
-This is not on-access or real-time protection. A file can be opened before the background scan finishes. See [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
+**How it checks a file without leaving it exposed on disk:** small downloads are
+moved into a short-lived holding area in your computer's memory (RAM), scanned
+there with the ClamAV antivirus engine, and only copied back to `~/Downloads` if
+they come back clean. Large files are scanned where they are instead of moved.
+If a held file turns out to be malware, it's deleted right out of memory, so no
+copy of it ever gets written to your disk. Full details, including the honest
+limits, are in [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md).
 
-Limitations: ClamAV catches known signatures, not zero-day malware. Files over 2 GiB are not scanned; they stay in Downloads and are logged only. If the scanner errors on a file, the file stays in place. You get a desktop alert after repeated failures.
+## What it doesn't do
+
+- It's not real-time, always-on protection. It checks a file after the download
+  finishes, not while your browser is writing it.
+- It only catches malware that ClamAV already has a signature for. Brand-new
+  ("zero-day") malware can get through.
+- It doesn't scan files bigger than 2 GiB. Those are left alone and logged.
+- Your browser still writes the download to disk before Tellina ever sees it.
+  Stopping that would need root access or a browser plugin, so Tellina doesn't
+  try. What it controls is what happens next: a clean file gets written back to
+  disk once more, and a file confirmed as malware is never written to disk again.
 
 ## Who this is for
 
-Linux desktop users on systemd, comfortable with a terminal. Debian and Ubuntu get a one-command install below. On Fedora, Arch, and other distros, install packages from your distro, then run `./install.sh --no-deps`.
+Linux desktop users on systemd who are comfortable with a terminal. Debian and
+Ubuntu get a one-command install below. On Fedora, Arch, and other distros,
+install the packages yourself, then run `./install.sh --no-deps`.
 
-No config file is required. Defaults are enough.
+No configuration file, no settings screen. The defaults are the product.
 
 ## Requirements
 
-- Linux with a systemd user session (typical desktop login)
-- bash 4+ and GNU coreutils (`date`, `stat`, and so on). Not macOS or BSD.
-- [ClamAV](https://www.clamav.net/) (scanner and virus definitions via `freshclam`). Not ClamTK; the GUI is optional and unused.
-- inotify-tools, file, unzip; poppler-utils optional (PDF structure check)
-- Desktop session with D-Bus (standard on GNOME, KDE, and similar; used for quarantine alerts)
+- Linux with a systemd user session (a normal desktop login)
+- bash 4+ and GNU coreutils. Not macOS or BSD.
+- [ClamAV](https://www.clamav.net/), the scanner (not the ClamTK GUI, which
+  Tellina doesn't need)
+- inotify-tools, file, unzip; poppler-utils is optional, for a PDF check
+- A desktop session with D-Bus (GNOME, KDE, and similar; used for alerts)
 
-`install.sh` on Debian and Ubuntu installs the packages above and waits for virus definitions before starting Tellina.
+`install.sh` installs all of this on Debian and Ubuntu, and waits for virus
+definitions to download before starting Tellina.
 
 ## Install
 
@@ -30,15 +53,16 @@ cd tellina
 ./install.sh
 ```
 
-The first install may spend several minutes downloading ClamAV signatures. That is normal.
+The first install can take a few minutes while it downloads ClamAV's virus
+definitions. That's normal.
 
-Already have dependencies?
+Already have the dependencies installed?
 
 ```bash
 ./install.sh --no-deps
 ```
 
-Fedora and Arch (install packages, then run the line above):
+Fedora and Arch (install the packages yourself first):
 
 ```bash
 # Fedora: sudo dnf install clamav clamav-freshclam inotify-tools file unzip
@@ -53,17 +77,37 @@ systemctl --user status download-security.service
 journalctl --user -u download-security.service -f
 ```
 
-Drop a clean file in `~/Downloads`. You should see one `OK` line in the journal. No popup on pass is normal.
+Drop a clean file into `~/Downloads`. You should see one `OK` line in the log
+(small files show a `HOLD` line first, then `OK`). Seeing no popup is the
+normal, expected result for a clean file.
+
+## How the staging area works
+
+A small download is moved into a private folder that lives in memory, not on
+disk (technically, your system's `tmpfs`). It's scanned there and copied back
+to `~/Downloads` only if it comes back clean. A file that can't be clearly
+judged, a corrupt document, one that changed while it was being scanned, is
+quarantined rather than let through, which closes a gap from Tellina's first
+version (which let through anything that didn't explicitly fail). If the memory
+folder isn't available for some reason, Tellina just scans files where they are
+and says so in the log. More detail is in [docs/V2-PLAN.md](docs/V2-PLAN.md).
+
+Two more things it checks for specifically, because a plain virus scan misses
+them: a downloaded `.desktop` file (a launcher that runs a command when you
+double-click it, a common trick for smuggling in malware), and a large file
+that ClamAV would otherwise give up on partway through and call clean without
+finishing the scan.
 
 ## Optional: faster scans
 
-Tellina uses `clamdscan` when a working ClamAV daemon answers at startup (probed directly, not guessed from systemd unit names). Otherwise it uses `clamscan`.
+Tellina uses `clamdscan`, which talks to a background ClamAV daemon, whenever
+that daemon is running. Otherwise it falls back to the slower `clamscan`.
 
-For Debian and Ubuntu daemon and group setup:
+To set up the daemon on Debian and Ubuntu:
 
 ```bash
 ./scripts/enable-clamd.sh
-# log out and back in for clamav group membership
+# then log out and back in, so your account picks up clamav group membership
 ```
 
 ## Uninstall
@@ -78,26 +122,36 @@ For Debian and Ubuntu daemon and group setup:
 | Setting | Default |
 |---------|---------|
 | Watch directory | `~/Downloads` |
-| Quarantine | `~/.local/share/tellina/quarantine` |
-| Max scan size | 2 GiB (larger files not scanned; skipped with log) |
+| RAM hold | `$XDG_RUNTIME_DIR/tellina/hold` |
+| RAM hold max size | 6.25% of your RAM, between 128 MiB and 1 GiB (adjustable) |
+| Quarantine folder | `~/.local/share/tellina/quarantine` |
+| Max scan size | 2 GiB (bigger files are skipped, not scanned) |
 | Service name | `download-security.service` |
 
-Advanced overrides use environment variables. See [docs/OPERATOR.md](docs/OPERATOR.md).
+These can be changed with environment variables; see
+[docs/OPERATOR.md](docs/OPERATOR.md).
 
 ## Documentation
 
-- [Operator guide](docs/OPERATOR.md)
-- [Threat model](docs/THREAT-MODEL.md)
+- [Operator guide](docs/OPERATOR.md), for running and tuning Tellina
+- [Threat model](docs/THREAT-MODEL.md), the full honest account of what it
+  protects against and what it doesn't
+- [v2 design](docs/V2-PLAN.md), how it's built
 - [Changelog](CHANGELOG.md)
-- [Security](SECURITY.md)
+- [Security policy](SECURITY.md)
 
 ## Tests (developers)
 
-Local (full): `./tests/run.sh` requires `download-security.service` to be active. Covers inotify paths (slow write, browser rename) and journal integration.
+- `./tests/run.sh`: the full local suite. Needs the service running.
+- `./tests/run-ci.sh`: a headless subset that doesn't need a running service.
+  This is what CI runs.
+- `./tests/redteam.sh`: an adversarial suite that tries to break Tellina and
+  reports, honestly, what got through.
+- `./tests/stress.sh`: sends it a burst of files at once and checks it keeps
+  up correctly.
 
-CI / headless: `./tests/run-ci.sh` runs without a service or D-Bus. Uses `--scan-once` only (clean file, EICAR, fake PDF, fail-open, size cap).
-
-GitHub Actions runs `run-ci.sh` only. Inotify behavior, desktop notifications, and post-login auto-start are verified locally, not in CI.
+GitHub Actions runs `run-ci.sh` and `stress.sh` on every push. Desktop alerts
+and auto-start after login can only be checked by hand, via `run.sh`.
 
 ## License
 

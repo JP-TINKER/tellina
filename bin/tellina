@@ -1,7 +1,17 @@
 #!/usr/bin/env bash
-# Tellina: watch ~/Downloads; scan completed downloads (post-download gate, not on-access).
-# Pass: file stays in Downloads; one journal line (no popup).
-# Fail: quarantine + desktop alert.
+# Tellina v2: silent Linux download guard.
+# Watch ~/Downloads; move completed downloads to a RAM-backed staging area.
+#   small files -> private RAM-backed hold (XDG_RUNTIME_DIR) -> scan -> release on clean / quarantine on bad
+#   large files -> scan in place; quarantine only on malicious
+# Silent on pass. One desktop alert on fail or scanner trouble. No root, no network, no new deps.
+#
+# Verdicts: clean | malicious | unknown | too-large
+#   clean     -> small: released to ~/Downloads; large: left in place. Log OK, no alert.
+#   malicious -> quarantined (0400), one alert.
+#   unknown   -> small: quarantined + alert; large: left in place + log (never confiscate a big file).
+#   too-large -> left in place, logged, not called clean, no alert.
+# Scanner errors fail OPEN (file returned/left, not confiscated); unhealthy alert after 5 in a row.
+# This keeps the fail-open rule on scanner errors and the do-no-harm goal.
 
 set -euo pipefail
 export LC_ALL=C
@@ -11,21 +21,40 @@ QUARANTINE="${DOWNLOAD_QUARANTINE_DIR:-$HOME/.local/share/tellina/quarantine}"
 STABLE_WAIT="${DOWNLOAD_STABLE_SEC:-2}"
 DEBOUNCE_SEC="${DOWNLOAD_DEBOUNCE_SEC:-10}"
 ERROR_NOTIFY_THRESHOLD="${DOWNLOAD_ERROR_NOTIFY_THRESHOLD:-5}"
-MAX_SCAN_BYTES="${DOWNLOAD_MAX_SCAN_BYTES:-2147483648}"
+MAX_SCAN_BYTES="${DOWNLOAD_MAX_SCAN_BYTES:-2147483648}"      # 2 GiB: above this, not scanned
 DB_MAX_AGE_SEC="${DOWNLOAD_DB_MAX_AGE_SEC:-604800}"
-
-mkdir -p "$WATCH" "$QUARANTINE"
-chmod 700 "$QUARANTINE" 2>/dev/null || true
-WATCH_ROOT=$(realpath "$WATCH")
+# Reap window for orphaned release-echo suppression entries (cleanup only).
+# Suppression itself matches on inode+size regardless of age, so a burst whose
+# serial scan time outlasts any fixed TTL can no longer defeat it. 1 h bounds
+# memory and the narrow same-path/same-inode/same-size false-suppress case.
+RELEASE_SUPPRESS_TTL="${DOWNLOAD_SUPPRESS_TTL:-3600}"
+# RAM hold cap: adaptive by default. Unset DOWNLOAD_RAM_HOLD_MAX -> 6.25% of
+# physical RAM, clamped to [128 MiB, 1 GiB], so a big workstation holds most
+# installers/AppImages while a small laptop stays safe. Set the env var to pin.
+RAM_HOLD_FLOOR=$((128 * 1024 * 1024))     # 128 MiB
+RAM_HOLD_CEIL=$((1024 * 1024 * 1024))     # 1 GiB
+RAM_HOLD_MAX_BYTES=""
 
 CONSEC_ERRORS=0
 ERROR_NOTIFIED=0
 DB_STALE_NOTIFIED=0
 AV_BACKEND=clamscan
+HOLD=""
+WATCH_ROOT=""
+HELD_FILE=""
+SUPPRESS_CHECK_COUNTER=0
+SELFTEST=0
+LIVE_LOOP=0
+LAST_SAFETY_RESCAN=0
+SAFETY_RESCAN_MIN_SEC="${DOWNLOAD_RESCAN_MIN_SEC:-10}"
 declare -A RECENTLY_SCANNED
+declare -A RELEASE_SUPPRESS
 
+# Scrub CR/LF so a crafted filename cannot inject forged journal lines.
 log() {
-  echo "$(date -Is) $*"
+  local msg=${*//$'\n'/ }
+  msg=${msg//$'\r'/ }
+  printf '%s %s\n' "$(date -Is)" "$msg"
 }
 
 clamav_db_dir() {
@@ -64,19 +93,15 @@ session_bus_address() {
   return 1
 }
 
-# Desktop toast via session D-Bus (gdbus/dbus-send). Same bubble as notify-send; no extra package.
 notify_desktop() {
   local summary="$1" body="$2" urgency="${3:-critical}"
   local timeout hints bus_addr
-
   bus_addr=$(session_bus_address) || return 1
   export DBUS_SESSION_BUS_ADDRESS="$bus_addr"
-
   case "$urgency" in
     critical) hints="{'urgency': <byte 2>}"; timeout=0 ;;
     *) hints="{}"; timeout=5000 ;;
   esac
-
   if command -v gdbus >/dev/null 2>&1; then
     gdbus call --session \
       --dest org.freedesktop.Notifications \
@@ -85,7 +110,6 @@ notify_desktop() {
       "Tellina" 0 "" "$summary" "$body" "[]" "$hints" "$timeout" \
       >/dev/null 2>&1 && return 0
   fi
-
   if command -v dbus-send >/dev/null 2>&1; then
     dbus-send --session --dest=org.freedesktop.Notifications \
       /org/freedesktop/Notifications \
@@ -94,13 +118,11 @@ notify_desktop() {
       array:string: dict:string:string: int32:"$timeout" \
       >/dev/null 2>&1 && return 0
   fi
-
   if command -v notify-send >/dev/null 2>&1; then
     local uflag=normal
     [[ "$urgency" == critical ]] && uflag=critical
     notify-send "$summary" "$body" -u "$uflag" 2>/dev/null && return 0
   fi
-
   return 1
 }
 
@@ -136,35 +158,64 @@ check_db_freshness() {
   fi
 }
 
+# Resolve the per-file RAM-hold cap. An explicit DOWNLOAD_RAM_HOLD_MAX wins;
+# otherwise take 6.25% (1/16) of physical RAM, clamped to [128 MiB, 1 GiB].
+# Reads /proc/meminfo (no new dependency) and falls back to 256 MiB if unreadable.
+resolve_ram_hold_max() {
+  if [[ -n "${DOWNLOAD_RAM_HOLD_MAX:-}" ]]; then
+    RAM_HOLD_MAX_BYTES="$DOWNLOAD_RAM_HOLD_MAX"
+    return 0
+  fi
+  local total_kb pct
+  total_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+  if (( total_kb <= 0 )); then
+    RAM_HOLD_MAX_BYTES=$((256 * 1024 * 1024))
+    return 0
+  fi
+  pct=$(( total_kb * 1024 / 16 ))   # 6.25% of RAM, in bytes
+  (( pct < RAM_HOLD_FLOOR )) && pct=$RAM_HOLD_FLOOR
+  (( pct > RAM_HOLD_CEIL )) && pct=$RAM_HOLD_CEIL
+  RAM_HOLD_MAX_BYTES=$pct
+}
+
+setup_runtime() {
+  mkdir -p "$WATCH" "$QUARANTINE"
+  chmod 700 "$QUARANTINE" 2>/dev/null || true
+  WATCH_ROOT=$(realpath "$WATCH")
+  resolve_ram_hold_max
+  HOLD=""
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" && -w "$XDG_RUNTIME_DIR" ]]; then
+    HOLD="$XDG_RUNTIME_DIR/tellina/hold"
+    if ! { mkdir -p "$HOLD" 2>/dev/null && chmod 700 "$HOLD" 2>/dev/null; }; then
+      HOLD=""
+    fi
+  fi
+  if [[ -z "$HOLD" ]]; then
+    log "WARN no RAM hold (XDG_RUNTIME_DIR unavailable); all files scanned in place"
+  fi
+}
+
 preflight() {
-  local rc=0 testfile
-
+  local rc=0
   for cmd in inotifywait clamscan file; do
-    command -v "$cmd" >/dev/null || {
-      log "FATAL missing dependency: $cmd"
-      exit 1
-    }
+    command -v "$cmd" >/dev/null || { log "FATAL missing dependency: $cmd"; exit 1; }
   done
-
   if ! clamav_db_present "$(clamav_db_dir)"; then
     log "FATAL ClamAV virus database not found (DatabaseDirectory=$(clamav_db_dir))"
     exit 1
   fi
-
   check_db_freshness
-
   clamscan --version >/dev/null 2>&1 || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     log "FATAL clamscan unusable (rc=$rc)"
     exit 1
   fi
-
   if probe_clamdscan; then
     AV_BACKEND=clamdscan
   elif command -v clamdscan >/dev/null 2>&1; then
     log "WARN clamdscan probe failed; using clamscan (daemon down or re-login after usermod -aG clamav)"
   fi
-  log "START backend=$AV_BACKEND watch=$WATCH_ROOT quarantine=$QUARANTINE max_scan_bytes=$MAX_SCAN_BYTES db=$(clamav_db_dir)"
+  log "START backend=$AV_BACKEND watch=$WATCH_ROOT quarantine=$QUARANTINE hold=${HOLD:-none} max_scan_bytes=$MAX_SCAN_BYTES ram_hold_max=$RAM_HOLD_MAX_BYTES db=$(clamav_db_dir)"
 }
 
 under_watch() {
@@ -204,14 +255,25 @@ wait_stable() {
 
 av_scan() {
   local f="$1" rc=0
-  if [[ -n "${TELLINA_TEST_AV_RC:-}" ]]; then
+  # Test hook: honored only on the one-shot self-test entrypoint, never in the
+  # live watch loop, so a hostile environment cannot disable scanning.
+  if [[ "$SELFTEST" == 1 && -n "${TELLINA_TEST_AV_RC:-}" ]]; then
     printf '%s' "$TELLINA_TEST_AV_RC"
     return 0
   fi
   if [[ "$AV_BACKEND" == clamdscan ]]; then
+    # clamdscan ignores CLI scan limits; the daemon honors MaxFileSize/MaxScanSize
+    # from clamd.conf. scripts/enable-clamd.sh raises those to Tellina's cap so the
+    # daemon does not silently pass a large file as clean without scanning it.
     clamdscan --fdpass --no-summary "$f" >/dev/null 2>&1 || rc=$?
   else
-    clamscan --infected --no-summary "$f" >/dev/null 2>&1 || rc=$?
+    # By default clamscan stops at MaxFileSize/MaxScanSize (100 MiB / 400 MiB) and
+    # then reports the file "OK" without having scanned it. Raise both to Tellina's
+    # own cap so every file we accept is scanned end to end: no silent clean verdict
+    # on an unscanned file. (2 GiB is also ClamAV's internal ceiling, so they align.)
+    clamscan --infected --no-summary \
+      --max-filesize="$MAX_SCAN_BYTES" --max-scansize="$MAX_SCAN_BYTES" \
+      "$f" >/dev/null 2>&1 || rc=$?
   fi
   printf '%s' "$rc"
 }
@@ -236,12 +298,18 @@ structure_check() {
   case "$mime" in
     *PDF*)
       if command -v pdfinfo >/dev/null 2>&1; then
-        info=$(pdfinfo "$f" 2>&1) || true
+        # pdfinfo failing is inconclusive, not proof of corruption; do not
+        # quarantine a legitimate PDF just because pdfinfo choked on it.
+        info=$(pdfinfo "$f" 2>&1) || return 0
         if grep -qi '^Encrypted:[[:space:]]*yes' <<<"$info"; then
           return 0
         fi
         pages=$(awk -F: '/^Pages:/{gsub(/ /,"",$2); print $2; exit}' <<<"$info")
-        [[ -n "$pages" && "$pages" -gt 0 ]]
+        # Only a definitive zero-page report counts as corrupt.
+        if [[ "$pages" =~ ^[0-9]+$ ]] && (( pages == 0 )); then
+          return 1
+        fi
+        return 0
       else
         return 0
       fi
@@ -259,27 +327,321 @@ structure_check() {
   esac
 }
 
+# True only for a real binary executable (ELF/PE/Mach-O/.so) wearing a
+# document/image extension. Uses the MIME type, not file's human string, so a
+# plain text file that merely begins with "#!" (which file labels "... ASCII
+# text executable") is NOT misflagged. Files honestly named .exe/.bin or with
+# no extension are not "disguised" and fall through to ClamAV.
+is_disguised_exec() {
+  local mtype="$1" base="$2"
+  case "$mtype" in
+    application/x-executable|application/x-pie-executable|application/x-sharedlib|application/x-dosexec|application/x-mach-binary|application/vnd.microsoft.portable-executable|application/x-elf) ;;
+    *) return 1 ;;
+  esac
+  if [[ "${base,,}" =~ \.(pdf|epub|mobi|azw3|docx|doc|xls|xlsx|ppt|pptx|png|jpg|jpeg|gif|webp|txt|md|csv|rtf|odt|ods|odp)$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# True for a freedesktop .desktop launcher that carries an Exec= line. Such a
+# file runs an arbitrary command when double-clicked, and a downloaded one is a
+# leading Linux delivery trick (a launcher shipped inside a zip whose Exec= runs
+# curl | bash and opens a decoy document). ClamAV sees only text, and file(1)
+# types it text/plain, so neither the signature scan nor the disguise check
+# fires. Legitimate launchers are installed by packages into system application
+# directories, not downloaded, so a launcher arriving in Downloads is high
+# signal. Reads only the first 64 KiB so a padded launcher cannot stall the grep.
+is_desktop_launcher() {
+  local f="$1" base="$2" head
+  [[ "${base,,}" == *.desktop ]] || return 1
+  head=$(head -c 65536 "$f" 2>/dev/null || true)
+  grep -qi '^\[Desktop Entry\]' <<<"$head" || return 1
+  grep -qiE '^[[:space:]]*Exec[[:space:]]*=' <<<"$head"
+}
+
 quarantine() {
-  local f="$1" reason="$2"
-  local base dest stamp hash
-  base=$(basename "$f")
+  local f="$1" reason="$2" kind="${3:-blocked}" name="${4:-}" original="${5:-$f}" dispose="${6:-preserve}"
+  local dest stamp hash summary
+  [[ -n "$name" ]] || name=$(basename "$f")
   stamp=$(date +%Y%m%d-%H%M%S)
-  dest="$QUARANTINE/${stamp}__${base}"
-  hash=$(sha256sum "$f" | awk '{print $1}')
-  mv -f "$f" "$dest"
+  dest="$QUARANTINE/${stamp}__${name}"
+  hash=$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || true)
+  if [[ "$dispose" == unlink ]]; then
+    # RAM-held malicious file: record the facts, then delete it from the tmpfs
+    # hold with a plain unlink (rm). Nothing is overwritten; the file is in RAM,
+    # and overwriting is neither needed there nor reliable on an SSD. The malware
+    # is simply never copied onto the disk a second time. (The browser's original
+    # download write already happened and cannot be reliably scrubbed from an
+    # SSD; this only avoids adding a fresh on-disk copy.)
+    printf 'original=%s\nreason=%s\nverdict=%s\nsha256=%s\nquarantined=%s\nretained=no (unlinked from RAM hold)\n' \
+      "$original" "$reason" "$kind" "$hash" "$(date -Is)" >"$dest.meta" 2>/dev/null || true
+    rm -f "$f" "$f.ingress" 2>/dev/null || true
+    log "QUARANTINE $reason | sha256=$hash | not retained (unlinked from RAM hold) | $name"
+    notify_desktop "Download blocked: $name" "$reason" critical || true
+    return 0
+  fi
+  if ! mv -f "$f" "$dest" 2>/dev/null; then
+    log "WARN quarantine move failed: $f"
+    return 1
+  fi
   chmod 0400 "$dest" 2>/dev/null || true
+  rm -f "$f.ingress" 2>/dev/null || true
+  printf 'original=%s\nreason=%s\nverdict=%s\nsha256=%s\nquarantined=%s\n' \
+    "$original" "$reason" "$kind" "$hash" "$(date -Is)" >"$dest.meta" 2>/dev/null || true
   log "QUARANTINE $reason | sha256=$hash | $dest"
-  notify_desktop "Download blocked" "$base: $reason" critical || true
+  if [[ "$kind" == held ]]; then
+    summary="Download held: $name"
+  else
+    summary="Download blocked: $name"
+  fi
+  notify_desktop "$summary" "$reason" critical || true
+}
+
+decide_small() {
+  local size="$1" free_kb free_bytes need
+  [[ -n "$HOLD" && -d "$HOLD" ]] || return 1
+  (( size < RAM_HOLD_MAX_BYTES )) || return 1
+  free_kb=$(df -P "$HOLD" 2>/dev/null | awk 'NR==2{print $4}') || true
+  [[ -n "$free_kb" ]] || return 1
+  free_bytes=$(( free_kb * 1024 ))
+  # Cross-fs mv needs ~1x transient during copy+unlink, plus headroom for the
+  # scan to read the held file. 1.25x is enough and admits more files than 2x.
+  need=$(( size + size / 4 ))
+  (( need < free_bytes )) || return 1
+  return 0
+}
+
+move_to_hold() {
+  local src="$1" base stamp held size sha mode
+  base=$(basename "$src")
+  stamp=$(date +%Y%m%d-%H%M%S)
+  held="$HOLD/${stamp}__${base}"
+  while [[ -e "$held" ]]; do held="$HOLD/${stamp}__$RANDOM__${base}"; done
+  if ! mv -f "$src" "$held" 2>/dev/null; then
+    log "WARN move to hold failed; scanning in place: $src"
+    HELD_FILE=""
+    return 1
+  fi
+  # Capture the original mode before the 0600 hold chmod so release can restore
+  # it (a legitimately-executable AppImage under the cap should not lose +x).
+  mode=$(stat -c%a "$held" 2>/dev/null || echo 644)
+  chmod 0600 "$held" 2>/dev/null || true
+  size=$(stat -c%s "$held" 2>/dev/null || echo 0)
+  sha=$(sha256sum "$held" 2>/dev/null | awk '{print $1}' || true)
+  printf '%s\n%s\n%s\n%s\n' "$src" "$size" "$sha" "$mode" >"$held.ingress" 2>/dev/null || true
+  log "HOLD ${size}B | $src -> $held"
+  HELD_FILE="$held"
+  return 0
+}
+
+verify_fingerprint() {
+  local target="$1" sidecar orig insize insha cur_size cur_sha
+  sidecar="$target.ingress"
+  [[ -f "$sidecar" ]] || return 1
+  { read -r orig; read -r insize; read -r insha; } <"$sidecar" 2>/dev/null || true
+  [[ -n "$insize" && -n "$insha" ]] || return 1
+  cur_size=$(stat -c%s "$target" 2>/dev/null || echo -1)
+  cur_sha=$(sha256sum "$target" 2>/dev/null | awk '{print $1}' || true)
+  if [[ "$SELFTEST" == 1 && -n "${TELLINA_TEST_FINGERPRINT_FAIL:-}" ]]; then
+    return 1
+  fi
+  [[ "$cur_size" == "$insize" && "$cur_sha" == "$insha" ]]
+}
+
+release_to() {
+  local target="$1" orig="$2" kind="$3" mime="${4:-}"
+  local dest destdir canon ino sz size mode
+  dest="$orig"
+  destdir=$(dirname "$dest")
+  if ! mkdir -p "$destdir" 2>/dev/null; then
+    log "WARN cannot recreate release dir; quarantining: $dest"
+    quarantine "$target" "release dir unavailable" held
+    return 0
+  fi
+  if [[ -e "$dest" ]]; then
+    if cmp -s "$target" "$dest"; then
+      local psize
+      psize=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+      rm -f "$target" "$target.ingress"
+      log "OK ${psize}B | ${mime} | already present | $dest"
+      return 0
+    fi
+    dest="${orig}.tellina-$(date +%s)"
+    log "WARN release collision; writing: $dest"
+  fi
+  if ! cp -f "$target" "$dest" 2>/dev/null; then
+    log "WARN release copy failed; quarantining: $orig"
+    quarantine "$target" "release copy failed" held
+    return 0
+  fi
+  # Restore the mode captured at ingress (default 644 if the sidecar is missing
+  # or malformed) so a legitimately-executable small download keeps +x instead
+  # of being silently stripped. Validated to octal so a crafted sidecar cannot
+  # inject a non-mode argument into chmod.
+  mode=644
+  { read -r _; read -r _; read -r _; read -r mode; } <"$target.ingress" 2>/dev/null || true
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || mode=644
+  chmod "$mode" "$dest" 2>/dev/null || chmod 644 "$dest" 2>/dev/null || true
+  canon=$(realpath "$dest" 2>/dev/null || printf '%s' "$dest")
+  ino=$(stat -c%i "$dest" 2>/dev/null || echo 0)
+  sz=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+  RELEASE_SUPPRESS["$canon"]="$ino:$sz:$(($(date +%s)+RELEASE_SUPPRESS_TTL))"
+  size=$(stat -c%s "$target" 2>/dev/null || echo 0)
+  rm -f "$target" "$target.ingress"
+  if [[ "$kind" == clean ]]; then
+    log "OK ${size}B | ${mime} | $dest"
+  else
+    log "RELEASE unscanned | $dest"
+  fi
+}
+
+check_release_echo() {
+  local f="$1" canon entry eino rest esz ino sz
+  canon=$(realpath "$f" 2>/dev/null) || return 1
+  entry="${RELEASE_SUPPRESS[$canon]:-}"
+  [[ -n "$entry" ]] || return 1
+  # Match on inode+size with no age check: the echo is always Tellina's own
+  # release, so its identity never changes however long the burst took to drain.
+  # Age-based expiry is done only by cleanup_suppress, which reaps orphans.
+  eino=${entry%%:*}
+  rest=${entry#*:}
+  esz=${rest%%:*}
+  ino=$(stat -c%i "$f" 2>/dev/null || echo -1)
+  sz=$(stat -c%s "$f" 2>/dev/null || echo -1)
+  if [[ "$ino" == "$eino" && "$sz" == "$esz" ]]; then
+    unset "RELEASE_SUPPRESS[$canon]"
+    # Register the debounce map so a second event for this path (a file-manager
+    # touch or a duplicate inotify delivery) is skipped instead of fully
+    # re-processed now that the one-shot suppression entry has been consumed.
+    RECENTLY_SCANNED["$f"]=$(date +%s)
+    log "SKIP release echo: $f"
+    return 0
+  fi
+  unset "RELEASE_SUPPRESS[$canon]"
+  return 1
+}
+
+cleanup_suppress() {
+  local now k entry exp
+  now=$(date +%s)
+  for k in "${!RELEASE_SUPPRESS[@]}"; do
+    entry="${RELEASE_SUPPRESS[$k]}"
+    exp=${entry##*:}
+    (( now > exp )) && unset "RELEASE_SUPPRESS[$k]"
+  done
+  # Prune debounce entries past their window so the map does not grow without
+  # bound over a long-lived service.
+  for k in "${!RECENTLY_SCANNED[@]}"; do
+    (( now - RECENTLY_SCANNED[$k] > DEBOUNCE_SEC )) && unset "RECENTLY_SCANNED[$k]"
+  done
+}
+
+adjudicate() {
+  local target="$1" orig="$2" is_small="${3:-0}"
+  local mime mtype base rc size dispose
+  base=$(basename "$orig")
+  mime=$(file -b "$target" 2>/dev/null || echo unknown)
+  mtype=$(file -b --mime-type "$target" 2>/dev/null || echo application/octet-stream)
+
+  # A small file lives only in the RAM-backed hold (tmpfs). A confirmed-malicious
+  # verdict on it is deleted from RAM (a plain unlink) rather than copied into the
+  # on-disk quarantine, so Tellina never writes a second on-disk copy of the
+  # malware. Large files are already on disk and are preserved in quarantine as
+  # before.
+  dispose=preserve
+  (( is_small )) && dispose=unlink
+
+  # Desktop launcher: runs a command when opened, invisible to the signature scan
+  # and the type/extension check. Caught before the AV scan. Preserved (not
+  # unlinked) because a downloaded launcher is only rarely legitimate and should
+  # stay recoverable if it was.
+  if is_desktop_launcher "$target" "$base"; then
+    quarantine "$target" "desktop launcher (runs a command when opened)" blocked "$base" "$orig" preserve
+    record_scan_ok
+    return 0
+  fi
+
+  if is_disguised_exec "$mtype" "$base"; then
+    quarantine "$target" "disguised executable ($mime)" blocked "$base" "$orig" "$dispose"
+    record_scan_ok
+    return 0
+  fi
+
+  if ! structure_check "$target" "$mime"; then
+    if (( is_small )); then
+      quarantine "$target" "corrupt or invalid document" held "$base" "$orig" preserve
+    else
+      log "SKIP corrupt document (large, left in place): $orig"
+    fi
+    return 0
+  fi
+
+  rc=$(av_scan "$target")
+  if (( rc == 1 )); then
+    quarantine "$target" "malware detected" blocked "$base" "$orig" "$dispose"
+    record_scan_ok
+    return 0
+  elif (( rc != 0 )); then
+    record_scan_error "$rc" "$orig"
+    if (( is_small )); then
+      release_to "$target" "$orig" failopen
+    fi
+    return 0
+  fi
+  record_scan_ok
+
+  if (( is_small )); then
+    if verify_fingerprint "$target"; then
+      release_to "$target" "$orig" clean "$mime"
+    else
+      quarantine "$target" "fingerprint mismatch (altered in hold)" held "$base" "$orig"
+    fi
+  else
+    size=$(stat -c%s "$target" 2>/dev/null || echo 0)
+    log "OK ${size}B | $mime | $orig"
+  fi
+}
+
+# NUL-safe safety net for watch events the read loop cannot name. inotifywait's
+# monitor mode is newline-delimited, so a filename containing a newline is split
+# into fragments that resolve to nothing (see scan_file's missing-path branch).
+# The real name cannot be rebuilt from the stream, so sweep the watch root with a
+# NUL-delimited find and hand any recently-arrived file to scan_file. Debounced
+# so transient temp churn cannot spin it, and limited to files modified in the
+# last two minutes so it never re-churns the whole folder.
+safety_rescan() {
+  local now f
+  now=$(date +%s)
+  (( now - LAST_SAFETY_RESCAN < SAFETY_RESCAN_MIN_SEC )) && return 0
+  LAST_SAFETY_RESCAN=$now
+  [[ -n "$WATCH_ROOT" && -d "$WATCH_ROOT" ]] || return 0
+  log "RESCAN safety sweep (unnameable watch event; scanning recent files in watch root)"
+  while IFS= read -r -d '' f; do
+    scan_file "$f" || log "ERROR processing $f"
+  done < <(find "$WATCH_ROOT" -type f -mmin -2 -print0 2>/dev/null)
 }
 
 scan_file() {
-  local f="$1"
-  [[ -f "$f" ]] || return 0
+  local f="$1" size base mtype mime
+  if [[ ! -f "$f" ]]; then
+    # A watch event that does not resolve to a regular file. Usually a
+    # transient temp file renamed away; but a filename containing a newline is
+    # split by the read loop into a path that never existed. Leave a breadcrumb
+    # and, in the live loop, trigger a NUL-safe sweep to catch the file the
+    # event could not name.
+    if [[ ! -e "$f" ]] && ! skip_name "$(basename "$f")"; then
+      log "SKIP event path missing (renamed away or unusual filename): $f"
+      (( LIVE_LOOP )) && safety_rescan
+    fi
+    return 0
+  fi
   skip_name "$(basename "$f")" && return 0
   under_watch "$f" || {
     log "SKIP path outside watch root: $f"
     return 0
   }
+  check_release_echo "$f" && return 0
 
   if ! wait_stable "$f"; then
     log "SKIP unstable or empty: $f"
@@ -292,39 +654,63 @@ scan_file() {
   }
   recently_scanned "$f" && return 0
 
-  local mime size rc
-  mime=$(file -b "$f" 2>/dev/null || echo unknown)
-  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
+  SUPPRESS_CHECK_COUNTER=$((SUPPRESS_CHECK_COUNTER + 1))
+  (( SUPPRESS_CHECK_COUNTER % 64 == 0 )) && cleanup_suppress
 
+  size=$(stat -c%s "$f" 2>/dev/null || echo 0)
   if (( size > MAX_SCAN_BYTES )); then
+    # Too large for a full content scan, but the disguised-executable check reads
+    # only a file header (milliseconds even on multi-GB files), so still run it:
+    # a real executable padded past the cap and wearing a document name is caught
+    # instead of released unscanned. A padded known-signature virus over the cap
+    # still passes (no content scan); that limit stays documented.
+    base=$(basename "$f")
+    mtype=$(file -b --mime-type "$f" 2>/dev/null || echo application/octet-stream)
+    if is_disguised_exec "$mtype" "$base"; then
+      mime=$(file -b "$f" 2>/dev/null || echo unknown)
+      quarantine "$f" "disguised executable ($mime)" blocked "$base" "$f"
+      return 0
+    fi
     log "SKIP too large (${size}B > ${MAX_SCAN_BYTES}B): $f"
     return 0
   fi
 
-  rc=$(av_scan "$f")
-  if [[ "$rc" -eq 1 ]]; then
-    quarantine "$f" "malware detected"
-    record_scan_ok
-    return 0
-  elif [[ "$rc" -ne 0 ]]; then
-    record_scan_error "$rc" "$f"
-    return 0
-  fi
-  record_scan_ok
-
-  if [[ "$mime" == *executable* || "$mime" == *"MS Windows"* || "$mime" == *"ELF "* ]]; then
-    if [[ "${f,,}" =~ \.(pdf|epub|mobi|azw3|docx|png|jpg|jpeg|gif|webp|txt|md|csv)$ ]]; then
-      quarantine "$f" "extension mismatch ($mime)"
-      return 0
+  if decide_small "$size"; then
+    if move_to_hold "$f"; then
+      adjudicate "$HELD_FILE" "$f" 1
+    else
+      adjudicate "$f" "$f" 0
     fi
+  else
+    adjudicate "$f" "$f" 0
   fi
+}
 
-  if ! structure_check "$f" "$mime"; then
-    quarantine "$f" "corrupt or invalid document"
-    return 0
-  fi
-
-  log "OK ${size}B | $mime | $f"
+sweep_hold() {
+  [[ -n "$HOLD" && -d "$HOLD" ]] || return 0
+  shopt -s nullglob
+  local f sidecar orig canon
+  for f in "$HOLD"/*; do
+    [[ -f "$f" ]] || continue
+    case "$(basename "$f")" in *.ingress) continue ;; esac
+    sidecar="$f.ingress"
+    orig=""
+    [[ -f "$sidecar" ]] && orig=$(head -1 "$sidecar" 2>/dev/null || true)
+    [[ -n "$orig" ]] || orig="$WATCH_ROOT/$(basename "$f")"
+    # The sidecar path is not trusted as a release target: confine release to
+    # the watch root so a crafted .ingress cannot write outside ~/Downloads.
+    canon=$(realpath -m "$orig" 2>/dev/null || printf '%s' "$orig")
+    if [[ "$canon" != "$WATCH_ROOT"/* ]]; then
+      log "WARN sweep destination outside watch root; redirecting to Downloads: $orig"
+      orig="$WATCH_ROOT/$(basename "$orig")"
+    fi
+    log "SWEEP reprocessing stranded hold file: $f -> $orig"
+    # Guarded: like the main watch loop, the `|| log` suppresses set -e for the
+    # whole adjudicate body (e.g. quarantine returns 1 on a failed move) so one
+    # bad stranded file does not abort the sweep and strand the rest.
+    adjudicate "$f" "$orig" 1 || log "ERROR sweeping $f"
+  done
+  shopt -u nullglob
 }
 
 if [[ "${1:-}" == "--notify" ]]; then
@@ -335,13 +721,34 @@ fi
 
 if [[ "${1:-}" == "--scan-once" ]]; then
   shift
+  SELFTEST=1   # one-shot self-test entry: enables TELLINA_TEST_* hooks here only
+  setup_runtime
   preflight
-  scan_file "${1:?path required for --scan-once}"
+  # The `|| log` is load-bearing: it suppresses set -e for the whole scan_file
+  # body so a failing command inside cannot exit the run early. Do not remove.
+  scan_file "${1:?path required for --scan-once}" || log "ERROR processing $1"
   exit 0
 fi
 
-preflight
+if [[ "${1:-}" == "--sweep-once" ]]; then
+  # Run the crash-sweep over the RAM hold and exit. Useful for operators and CI.
+  setup_runtime
+  preflight
+  sweep_hold
+  exit 0
+fi
 
+setup_runtime
+preflight
+sweep_hold
+
+# Live loop from here on: enable the safety-net rescan for unnameable events.
+LIVE_LOOP=1
 inotifywait -r -m -e close_write -e moved_to --format '%w%f' "$WATCH_ROOT" | while read -r path; do
+  # The `|| log` is load-bearing: it disables set -e for the entire scan_file
+  # body, so no failing command inside (guarded or not) can propagate up and
+  # kill this while-read loop, leaving the service live-but-deaf. Do not "clean
+  # up" this guard -- removing it makes any internal failure silently kill the
+  # download guard mid-stream.
   scan_file "$path" || log "ERROR processing $path"
 done

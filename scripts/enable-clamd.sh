@@ -15,6 +15,24 @@ elif ! grep -q '^NotifyClamd' /etc/clamav/freshclam.conf 2>/dev/null; then
   echo 'NotifyClamd /etc/clamav/clamd.conf' | sudo tee -a /etc/clamav/freshclam.conf >/dev/null
 fi
 
+# Raise the daemon's scan limits to Tellina's cap (2 GiB, ClamAV's internal
+# ceiling). Without this, clamd keeps its defaults (MaxFileSize 100 MiB,
+# MaxScanSize 400 MiB) and reports any larger file "OK" without scanning it,
+# which would let Tellina release a big download as clean unscanned. clamdscan
+# ignores command-line limits, so they must be set here in clamd.conf.
+CLAMD_CONF=/etc/clamav/clamd.conf
+if [[ -f "$CLAMD_CONF" ]]; then
+  for kv in "MaxFileSize 2G" "MaxScanSize 2G"; do
+    key=${kv%% *}
+    if grep -qE "^${key} " "$CLAMD_CONF"; then
+      sudo sed -i "s|^${key} .*|${kv}|" "$CLAMD_CONF"
+    else
+      echo "$kv" | sudo tee -a "$CLAMD_CONF" >/dev/null
+    fi
+  done
+  echo "Set ${CLAMD_CONF}: MaxFileSize 2G, MaxScanSize 2G."
+fi
+
 echo "Starting daemons..."
 sudo systemctl enable --now clamav-daemon clamav-freshclam
 
